@@ -8,7 +8,7 @@ import portalocker  # We'll use this for cross-platform file locking
 MAX_KEY_LENGTH = 32
 MAX_VALUE_SIZE = 16 * 1024  # 16KB
 MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1GB
-BATCH_LIMIT = 100  # Maximum number of items in a batch operation
+BATCH_LIMIT = 1000 # Maximum number of items in a batch operation
 
 class KeyValueStoreError(Exception):
     """Base exception for KeyValueStore errors"""
@@ -60,25 +60,18 @@ class KeyValueStore:
         
         with self.lock:
             if key in self.data:
-                # Instead of raising an error, we'll update the existing key
-                print(f"Warning: Key '{key}' already exists. Updating its value.")
-                self.data[key]["value"] = value
-                if ttl:
-                    self.data[key]["expiry"] = time.time() + ttl
-                else:
-                    self.data[key]["expiry"] = None
-            else:
-                new_entry = {
-                    "value": value,
-                    "expiry": time.time() + ttl if ttl else None
-                }
-                
-                # Check if adding this entry would exceed the file size limit
-                if self._would_exceed_file_size_limit(key, new_entry):
-                    raise FileSizeLimitExceededError("Adding this entry would exceed the file size limit")
-                
-                self.data[key] = new_entry
+                raise KeyExistsError(f"Key '{key}' already exists")
             
+            new_entry = {
+                "value": value,
+                "expiry": time.time() + ttl if ttl else None
+            }
+            
+            # Check if adding this entry would exceed the file size limit
+            if self._would_exceed_file_size_limit(key, new_entry):
+                raise FileSizeLimitExceededError("Adding this entry would exceed the file size limit")
+            
+            self.data[key] = new_entry
             self.save_data()
 
     def read(self, key: str) -> Dict[str, Any]:
@@ -99,16 +92,25 @@ class KeyValueStore:
             if key not in self.data:
                 raise KeyNotFoundError("Key not found")
             
-            del self.data[key]
-            self.save_data()
+            entry = self.data[key]
+            if entry["expiry"] and time.time() > entry["expiry"]:
+                del self.data[key]
+                self.save_data()
+                raise KeyNotFoundError("Key has expired")
+        
 
-    def batch_create(self, items: Dict[str, Dict[str, Any]]) -> None:
+    def batch_create(self, items: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
         if len(items) > BATCH_LIMIT:
             raise BatchSizeLimitExceededError(f"Batch size cannot exceed {BATCH_LIMIT} items")
         
+        results = {}
         with self.lock:
             for key, value in items.items():
-                self.create(key, value)
+                try:
+                    self.create(key, value)
+                    results[key] = "Success"
+                except KeyValueStoreError as e:
+                    results[key] = str(e)
 
     def load_data(self) -> None:
         with self.file_lock:
@@ -118,8 +120,10 @@ class KeyValueStore:
 
     def save_data(self) -> None:
         with self.file_lock:
-            with portalocker.Lock(self.file_path, 'w', timeout=10) as f:
+            temp_file = f"{self.file_path}.tmp"
+            with portalocker.Lock(temp_file, 'w', timeout=10) as f:
                 json.dump(self.data, f)
+            os.replace(temp_file, self.file_path)
 
     def _ttl_cleanup(self) -> None:
         while True:
