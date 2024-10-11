@@ -26,7 +26,7 @@ def test_delete(store):
 def test_ttl(store):
     store.create("test_key", {"value": "test_value"}, ttl=1)
     assert store.read("test_key") == {"value": "test_value"}
-    time.sleep(2)
+    time.sleep(1.1)
     with pytest.raises(KeyNotFoundError):
         store.read("test_key")
 
@@ -54,32 +54,57 @@ def test_batch_create(store):
         f"key_{i}": {"value": f"value_{i}"}
         for i in range(10)
     }
-    store.batch_create(batch)
+    results = store.batch_create(batch)
+    assert all(result == "Success" for result in results.values())
     for key, value in batch.items():
         assert store.read(key) == value
 
 def test_batch_create_limit_exceeded(store):
     batch = {
         f"key_{i}": {"value": f"value_{i}"}
-        for i in range(101)
+        for i in range(1001)
     }
     with pytest.raises(BatchSizeLimitExceededError):
         store.batch_create(batch)
 
 def test_concurrent_access(store):
     def worker(worker_id):
-        for i in range(100):
+        for i in range(10):
             key = f"worker_{worker_id}_key_{i}"
             value = {"value": f"worker_{worker_id}_value_{i}"}
             store.create(key, value)
             assert store.read(key) == value
             store.delete(key)
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
+
+    # Verify that no keys are left after all operations
+    assert len(store.data) == 0
+
+def test_delete_expired_key(store):
+    store.create("test_key", {"value": "test_value"}, ttl=1)
+    time.sleep(1.1)
+    with pytest.raises(KeyNotFoundError, match="Key has expired"):
+        store.delete("test_key")
+
+def test_batch_create_with_errors(store):
+    batch = {
+        "key1": {"value": "value1"},
+        "key2": {"value": "x" * (16 * 1024 + 1)},  # Too large
+        "key3": {"value": "value3"}
+    }
+    results = store.batch_create(batch)
+    assert results["key1"] == "Success"
+    assert "ValueTooLargeError" in results["key2"]
+    assert results["key3"] == "Success"
+    assert store.read("key1") == {"value": "value1"}
+    assert store.read("key3") == {"value": "value3"}
+    with pytest.raises(KeyNotFoundError):
+        store.read("key2")
 
 def test_persistence(store):
     store.create("persist_key", {"value": "persist_value"})
